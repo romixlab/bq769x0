@@ -7,7 +7,6 @@ use crc_any::CRCu8;
 
 #[cfg(not(std))]
 use cortex_m;
-use embedded_hal::blocking::i2c::{Write, WriteRead};
 
 pub struct BQ769x0 {
     dev_address: u8, // 7bit address

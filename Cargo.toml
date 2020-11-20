@@ -8,10 +8,10 @@ edition = "2018"
 
 [dependencies]
 embedded-hal = "0.2"
-cortex-m = "0.6.2"
+cortex-m = "0.6"
 
 [dependencies.crc-any]
-version = "2.3.0"
+version = "2.3"
 default-features = false
 
 [features]
