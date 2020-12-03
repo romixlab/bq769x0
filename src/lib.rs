@@ -17,7 +17,7 @@ pub struct BQ769x0 {
     shunt: MicroOhms,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum Error {
     //#[cfg(crc)]
     CRCMismatch,
@@ -658,6 +658,14 @@ impl BQ769x0 {
             return Err(Error::VerifyError(0x05));
         }
         Ok(())
+    }
+
+    pub fn is_charging<I2C>(&mut self, i2c: &mut I2C) -> Result<bool, Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        let mut sys_ctrl2 = [0u8; 1];
+        self.read_raw(i2c, 0x05, &mut sys_ctrl2)?;
+        Ok(sys_ctrl2[0] & 0b0000_0001 != 0)
     }
 
     pub fn ship_enter<I2C>(&mut self, i2c: &mut I2C) -> Result<(), Error>
