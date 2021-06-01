@@ -7,6 +7,10 @@ use crc_any::CRCu8;
 
 #[cfg(not(std))]
 use cortex_m;
+use core::ops::Sub;
+use bitflags::bitflags;
+
+use serde::{Serialize, Deserialize};
 
 pub struct BQ769x0 {
     dev_address: u8, // 7bit address
@@ -52,6 +56,19 @@ impl Stat {
     pub fn ocd_is_set(&self) -> bool { self.bits & (1u8 << 0) != 0 }
 
     pub fn is_ok(&self) -> bool { self.bits & 0b0011_1111 == 0 }
+}
+
+bitflags! {
+    pub struct SysStat: u8 {
+        const CC_READY      = 0b1000_0000;
+        const DEVICE_XREADY = 0b0010_0000;
+        const OVRD_ALERT    = 0b0001_0000;
+        const UNDERVOLTAGE  = 0b0000_1000;
+        const OVERVOLTAGE   = 0b0000_0100;
+        const SHORTCIRCUIT  = 0b0000_0010;
+        const OVERCURRENT   = 0b0000_0001;
+        const ALL           = 0b1011_1111;
+    }
 }
 
 impl fmt::Debug for Stat {
@@ -616,13 +633,13 @@ impl BQ769x0 {
         Ok(Stat{ bits: data[0] })
     }
 
-    pub fn sys_stat_reset<I2C>(&mut self, i2c: &mut I2C) -> Result<(), Error>
+    pub fn sys_stat_reset<I2C>(&mut self, i2c: &mut I2C, flags: SysStat) -> Result<(), Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
-        self.write_raw(i2c, 0x00, &[0xff])?;
+        self.write_raw(i2c, 0x00, &[flags.bits()])?;
         let mut verify = [0u8; 1];
         self.read_raw(i2c, 0x00, &mut verify)?;
-        if verify[0] != 0 {
+        if verify[0] & flags.bits() != 0 {
             return Err(Error::VerifyError(0x00));
         }
         Ok(())
@@ -674,7 +691,7 @@ impl BQ769x0 {
         Ok(())
     }
 
-    pub fn is_charging<I2C>(&mut self, i2c: &mut I2C) -> Result<bool, Error>
+    pub fn is_charge_enabled<I2C>(&mut self, i2c: &mut I2C) -> Result<bool, Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
         let mut sys_ctrl2 = [0u8; 1];
@@ -747,14 +764,14 @@ impl BQ769x0 {
 
         let ov_limits = self.ov_voltage_range();
         if !(config.ov_threshold >= ov_limits.0 && config.ov_threshold <= ov_limits.1) {
-            return Err(Error::OVThresholdUnobtainable);
+            return Err(Error::OVThresholdUnobtainable(ov_limits.0, ov_limits.1));
         }
         let ov_trip_full = ((config.ov_threshold.0 as i32 - self.adc_offset as i32) * 1000) / self.adc_gain as i32; // ADC value * 1000
         let ov_bits = (((ov_trip_full as u16) >> 4) & 0xff) as u8;
 
         let uv_limits = self.uv_voltage_range();
         if !(config.uv_threshold >= uv_limits.0 && config.uv_threshold <= uv_limits.1) {
-            return Err(Error::UVThresholdUnobtainable);
+            return Err(Error::UVThresholdUnobtainable(uv_limits.0, uv_limits.1));
         }
         let uv_trip_full = ((config.uv_threshold.0 as i32 - self.adc_offset as i32) * 1000) / self.adc_gain as i32; // ADC value * 1000
         let uv_bits = (((uv_trip_full as u16) >> 4) & 0xff) as u8;
