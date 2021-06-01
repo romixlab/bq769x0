@@ -563,6 +563,20 @@ impl BQ769x0 {
         Ok(cells)
     }
 
+    pub fn enable_balancing<I2C>(&mut self, i2c: &mut I2C, cells: u8) -> Result<(), Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        self.write_raw(i2c, 0x01, &[cells])
+    }
+
+    pub fn balancing_state<I2C>(&mut self, i2c: &mut I2C) -> Result<u8, Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        let mut data = [0u8; 1];
+        self.read_raw(i2c, 0x01, &mut data);
+        Ok(data[0])
+    }
+
     pub fn current<I2C>(&mut self, i2c: &mut I2C) -> Result<MilliAmperes, Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
