@@ -12,7 +12,11 @@ use bitflags::bitflags;
 
 use serde::{Serialize, Deserialize};
 
-pub struct BQ769x0 {
+pub const BQ76920: usize = 2;
+pub const BQ76930: usize = 3;
+pub const BQ76940: usize = 4;
+
+pub struct BQ769x0<const X: usize> {
     dev_address: u8, // 7bit address
     crc: CRCu8, // x8 + x2 + x + 1
     init_complete: bool,
@@ -30,8 +34,8 @@ pub enum Error {
     Uninitialized,
     VerifyError(u8),
     OCDSCDRangeMismatch,
-    UVThresholdUnobtainable,
-    OVThresholdUnobtainable,
+    UVThresholdUnobtainable(MilliVolts, MilliVolts),
+    OVThresholdUnobtainable(MilliVolts, MilliVolts),
 }
 
 // impl<E> From<E> for Error
@@ -120,14 +124,21 @@ impl SCDDelay {
 #[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
 pub struct Amperes(pub u32);
 
-#[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
+#[derive(Debug, PartialEq, PartialOrd, Clone, Copy, Serialize, Deserialize)]
 pub struct MilliAmperes(pub i32);
 
 #[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
 pub struct MicroOhms(pub u32);
 
-#[derive(Debug, PartialEq, PartialOrd, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Deserialize)]
 pub struct MilliVolts(pub u32);
+impl Sub for MilliVolts {
+    type Output = MilliVolts;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        MilliVolts(self.0 - rhs.0)
+    }
+}
 
 impl fmt::Display for Amperes {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -144,6 +155,14 @@ impl fmt::Display for MilliAmperes {
 impl fmt::Display for MilliVolts {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}mV", self.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct DegreesCentigrade(pub i32);
+impl fmt::Display for DegreesCentigrade {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}degC", self.0)
     }
 }
 
@@ -424,7 +443,7 @@ pub struct CalculatedValues {
     pub ov_threshold: MilliVolts
 }
 
-impl BQ769x0 {
+impl<const X: usize> BQ769x0<X> {
     pub fn new(dev_address: u8) -> Self {
         BQ769x0 { dev_address, crc: CRCu8::crc8(), init_complete: false, adc_gain: 0, adc_offset: 0, shunt: MicroOhms(0) }
     }
@@ -563,7 +582,7 @@ impl BQ769x0 {
         self.init_complete
     }
 
-    pub fn cell_voltages<I2C>(&mut self, i2c: &mut I2C) -> Result<[u16; 5], Error>
+    pub fn cell_voltages<I2C>(&mut self, i2c: &mut I2C) -> Result<[MilliVolts; 5], Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
         if !self.is_initialized() {
@@ -571,10 +590,10 @@ impl BQ769x0 {
         }
         let mut buf = [0u8; 10];
         self.read_raw(i2c, 0x0c, &mut buf)?;
-        let mut cells = [0u16; 5];
+        let mut cells = [MilliVolts(0); 5];
         for (i, cell) in cells.iter_mut().enumerate() {
             let adc_reading = ((buf[i * 2] as u16) << 8) | buf[i * 2 + 1] as u16;
-            *cell = self.adc_reading_to_mv(adc_reading).0 as u16;
+            *cell = self.adc_reading_to_mv(adc_reading);
         }
 
         Ok(cells)
@@ -623,6 +642,29 @@ impl BQ769x0 {
         let vv = u16::from_be_bytes(vv);
         let voltage = 4 * (self.adc_gain as i32) * (vv as i32) + 5 * (self.adc_offset as i32) * 1000;
         Ok(MilliVolts((voltage / 1000) as u32))
+    }
+
+    pub fn temperature<I2C>(&mut self, i2c: &mut I2C, source: TemperatureSource) -> Result<DegreesCentigrade, Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        self.temperature_source(i2c, source)?;
+
+        let mut ts = [0u8; 2];
+        self.read_raw(i2c, 0x2c, &mut ts)?;
+        let ts = u16::from_be_bytes(ts);
+        let vtsx = (ts as i32) * 382; // µV/LSB
+        Ok(DegreesCentigrade(vtsx))
+        // match source {
+        //     TemperatureSource::InternalDie => {
+        //         let v25 = 1200000; // µV at 25degC
+        //         let t = 25 - ((vtsx - v25) * 238);
+        //         Ok(DegreesCentigrade( t as i16 ))
+        //     }
+        //     TemperatureSource::ExternalThermistor => {
+        //         // let rts = (10_000 * vtsx)
+        //         Ok(DegreesCentigrade(0))
+        //     }
+        // }
     }
 
     pub fn sys_stat<I2C>(&mut self, i2c: &mut I2C) -> Result<Stat, Error>
@@ -797,6 +839,53 @@ impl BQ769x0 {
             ov_threshold: self.adc_reading_to_mv(0b10_0000_0000_1000 | ((ov_bits as u16) << 4))
         })
     }
+
+    pub fn enable_adc<I2C>(&mut self, i2c: &mut I2C, enable: bool) -> Result<(), Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        let mut sysctrl1 = [0u8; 1];
+        self.read_raw(i2c, 0x04, &mut sysctrl1)?;
+        sysctrl1[0] = sysctrl1[0] & !(1 << 4);
+        sysctrl1[0] = sysctrl1[0] | ((enable as u8) << 4);
+        self.write_raw(i2c, 0x04, &sysctrl1)
+    }
+
+    fn temperature_source<I2C>(&mut self, i2c: &mut I2C, source: TemperatureSource) -> Result<(), Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        let mut sysctrl1 = [0u8; 1];
+        self.read_raw(i2c, 0x04, &mut sysctrl1)?;
+        sysctrl1[0] = sysctrl1[0] & !(1 << 3);
+        let is_external = source == TemperatureSource::ExternalThermistor;
+        sysctrl1[0] = sysctrl1[0] | ((is_external as u8) << 3);
+        self.write_raw(i2c, 0x04, &sysctrl1)
+    }
+
+    pub fn coulomb_counter_mode<I2C>(&mut self, i2c: &mut I2C, mode: CoulombCounterMode) -> Result<(), Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        let mut sysctrl2 = [0u8; 1];
+        self.read_raw(i2c, 0x05, &mut sysctrl2)?;
+        sysctrl2[0] = sysctrl2[0] & !0b0110_0000;
+        match mode {
+            CoulombCounterMode::Disabled => {},
+            CoulombCounterMode::OneShot => { sysctrl2[0] = sysctrl2[0] | (1 << 5); }
+            CoulombCounterMode::Continuous => { sysctrl2[0] = sysctrl2[0] | (1 << 6); }
+        }
+        self.write_raw(i2c, 0x05, &sysctrl2)
+    }
+}
+
+pub enum CoulombCounterMode {
+    Disabled,
+    OneShot,
+    Continuous
+}
+
+#[derive(Eq, PartialEq, Copy, Clone)]
+pub enum TemperatureSource {
+    InternalDie,
+    ExternalThermistor
 }
 
 #[cfg(test)]
