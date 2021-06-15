@@ -1,4 +1,7 @@
 #![cfg_attr(not(std), no_std)]
+#![feature(const_generics)]
+#![feature(const_evaluatable_checked)]
+#![feature(const_panic)]
 
 use core::fmt;
 use core::fmt::Formatter;
@@ -12,17 +15,19 @@ use bitflags::bitflags;
 
 use serde::{Serialize, Deserialize};
 
-pub const BQ76920: usize = 2;
-pub const BQ76930: usize = 3;
-pub const BQ76940: usize = 4;
+pub const BQ76920: usize = 5;
+pub const BQ76930: usize = 10;
+pub const BQ76940: usize = 15;
 
 pub struct BQ769x0<const X: usize> {
     dev_address: u8, // 7bit address
-    crc: CRCu8, // x8 + x2 + x + 1
+    // crc: CRCu8, // x8 + x2 + x + 1
     init_complete: bool,
     adc_gain: u16, // uV / LSB
     adc_offset: i8, // mV
     shunt: MicroOhms,
+    cell_count: u8,
+    cells: [MilliVolts; X]
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -443,9 +448,42 @@ pub struct CalculatedValues {
     pub ov_threshold: MilliVolts
 }
 
-impl<const X: usize> BQ769x0<X> {
-    pub fn new(dev_address: u8) -> Self {
-        BQ769x0 { dev_address, crc: CRCu8::crc8(), init_complete: false, adc_gain: 0, adc_offset: 0, shunt: MicroOhms(0) }
+impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
+    pub const fn new(dev_address: u8, cell_count: u8) -> Option<Self> {
+        match X {
+            BQ76920 | BQ76930 | BQ76940 => {
+                match X {
+                    BQ76920 => {
+                        if cell_count < 3 || cell_count > 5 {
+                            return None;
+                        }
+                    }
+                    BQ76930 => {
+                        if cell_count < 6 || cell_count > 10 {
+                            return None;
+                        }
+                    }
+                    BQ76940 => {
+                        if cell_count < 9 || cell_count > 15 {
+                            return None;
+                        }
+                    },
+                    _ => unreachable!()
+                }
+                Some(BQ769x0 {
+                    dev_address,
+                    init_complete: false,
+                    adc_gain: 0,
+                    adc_offset: 0,
+                    shunt: MicroOhms(0),
+                    cell_count,
+                    cells: [MilliVolts(0); X]
+                })
+            },
+            _ => {
+                None
+            }
+        }
     }
 
     pub fn adc_gain(&self) -> u16 {
@@ -485,16 +523,17 @@ impl<const X: usize> BQ769x0<X> {
         }
         let mut buf = [0u8; 10*2]; // byte,crc,byte,crc,...
         let r = i2c.write_read(self.dev_address, &[reg_address], &mut buf[0..data.len()*2]);
-        self.crc.reset();
-        self.crc.digest(&[(self.dev_address << 1) | 0b0000_0001, buf[0]]);
-        if self.crc.get_crc() != buf[1] {
+        let mut crc = CRCu8::crc8();
+        crc.reset();
+        crc.digest(&[(self.dev_address << 1) | 0b0000_0001, buf[0]]);
+        if crc.get_crc() != buf[1] {
             return Err(Error::CRCMismatch);
         }
         if data.len() > 1 {
             for i in (3..data.len()*2).step_by(2) {
-                self.crc.reset();
-                self.crc.digest(&[buf[i - 1]]);
-                if self.crc.get_crc() != buf[i] {
+                crc.reset();
+                crc.digest(&[buf[i - 1]]);
+                if crc.get_crc() != buf[i] {
                     return Err(Error::CRCMismatch);
                 }
             }
@@ -552,13 +591,14 @@ impl<const X: usize> BQ769x0<X> {
         for (i, b) in data.iter().enumerate() {
             buf[i * 2 + 1] = *b;
         }
-        self.crc.reset();
-        self.crc.digest(&[(self.dev_address << 1), reg_address, data[0]]);
-        buf[2] = self.crc.get_crc();
+        let mut crc = CRCu8::crc8();
+        crc.reset();
+        crc.digest(&[(self.dev_address << 1), reg_address, data[0]]);
+        buf[2] = crc.get_crc();
         for i in (4..data.len()*2+1).step_by(2) {
-            self.crc.reset();
-            self.crc.digest(&[ buf[i-1] ]);
-            buf[i] = self.crc.get_crc();
+            crc.reset();
+            crc.digest(&[ buf[i-1] ]);
+            buf[i] = crc.get_crc();
         }
         i2c.write(self.dev_address, &buf[0..data.len()*2+1]).map_err(|_| Error::I2CError)?;
 
@@ -582,21 +622,45 @@ impl<const X: usize> BQ769x0<X> {
         self.init_complete
     }
 
-    pub fn cell_voltages<I2C>(&mut self, i2c: &mut I2C) -> Result<[MilliVolts; 5], Error>
+    pub fn cell_voltages<I2C>(&mut self, i2c: &mut I2C) -> Result<&[MilliVolts], Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
         if !self.is_initialized() {
             return Err(Error::Uninitialized);
         }
-        let mut buf = [0u8; 10];
+        let mut buf = [0u8; X * 2];
         self.read_raw(i2c, 0x0c, &mut buf)?;
-        let mut cells = [MilliVolts(0); 5];
-        for (i, cell) in cells.iter_mut().enumerate() {
+        let adc_tf = self.adc_transfer_function();
+        for (i, cell) in self.cells.iter_mut().enumerate() {
             let adc_reading = ((buf[i * 2] as u16) << 8) | buf[i * 2 + 1] as u16;
-            *cell = self.adc_reading_to_mv(adc_reading);
+            *cell = adc_tf.apply(adc_reading);
         }
 
-        Ok(cells)
+        let cc = self.cell_count;
+
+        if cc == 3 || cc == 6 || cc == 9 {
+            self.cells[2] = self.cells[4];
+        } else if cc == 4 || cc == 7 || cc == 8 || cc == 10 || cc == 11 || cc == 12 {
+            self.cells[3] = self.cells[4];
+        }
+
+        if (X == BQ76930 || X == BQ76940) && (cc == 6 || cc == 7 || cc == 9 || cc == 10) {
+            self.cells[7] = self.cells[9];
+        }
+
+        if (X == BQ76930 || X == BQ76940) && (cc == 8 || cc == 9 || cc == 11 || cc == 12 || cc == 13) {
+            self.cells[8] = self.cells[9];
+        }
+
+        if (X == BQ76940) && (cc == 9 || cc == 10 || cc == 11) {
+            self.cells[12] = self.cells[14];
+        }
+
+        if (X == BQ76940) && (cc == 12 || cc == 13 || cc == 14) {
+            self.cells[13] = self.cells[14];
+        }
+
+        Ok(&self.cells[..self.cell_count as usize])
     }
 
     pub fn enable_balancing<I2C>(&mut self, i2c: &mut I2C, cells: u8) -> Result<(), Error>
@@ -609,7 +673,7 @@ impl<const X: usize> BQ769x0<X> {
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
         let mut data = [0u8; 1];
-        self.read_raw(i2c, 0x01, &mut data);
+        self.read_raw(i2c, 0x01, &mut data)?;
         Ok(data[0])
     }
 
@@ -644,16 +708,23 @@ impl<const X: usize> BQ769x0<X> {
         Ok(MilliVolts((voltage / 1000) as u32))
     }
 
-    pub fn temperature<I2C>(&mut self, i2c: &mut I2C, source: TemperatureSource) -> Result<DegreesCentigrade, Error>
+    pub fn temperature<I2C>(&mut self, i2c: &mut I2C) -> Result<Temperature, Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
-        self.temperature_source(i2c, source)?;
-
         let mut ts = [0u8; 2];
         self.read_raw(i2c, 0x2c, &mut ts)?;
         let ts = u16::from_be_bytes(ts);
         let vtsx = (ts as i32) * 382; // µV/LSB
-        Ok(DegreesCentigrade(vtsx))
+        match self.temperature_source(i2c)? {
+            TemperatureSource::InternalDie => {
+
+                Ok(Temperature::InternalDie(DegreesCentigrade(vtsx)))
+            }
+            TemperatureSource::ExternalThermistor => {
+
+                Ok(Temperature::ExternalThermistor(DegreesCentigrade(vtsx)))
+            }
+        }
         // match source {
         //     TemperatureSource::InternalDie => {
         //         let v25 = 1200000; // µV at 25degC
@@ -750,22 +821,23 @@ impl<const X: usize> BQ769x0<X> {
         Ok(())
     }
 
-    fn adc_reading_to_mv(&self, adc_reading: u16) -> MilliVolts {
-        let adc_reading = adc_reading as i32;
-        let uv = adc_reading * self.adc_gain as i32 + self.adc_offset as i32 * 1000;
-        MilliVolts((uv / 1000) as u32)
+    fn adc_transfer_function(&self) -> AdcTransferFunction {
+        AdcTransferFunction {
+            gain: self.adc_gain,
+            offset: self.adc_offset
+        }
     }
 
     fn ov_voltage_range(&self) -> (MilliVolts, MilliVolts) {
         let min_adc_reading = 0b10_0000_0000_1000;
         let max_adc_reading = 0b10_1111_1111_1000;
-        (self.adc_reading_to_mv(min_adc_reading), self.adc_reading_to_mv(max_adc_reading))
+        (self.adc_transfer_function().apply(min_adc_reading), self.adc_transfer_function().apply(max_adc_reading))
     }
 
     fn uv_voltage_range(&self) -> (MilliVolts, MilliVolts) {
         let min_adc_reading = 0b01_0000_0000_0000;
         let max_adc_reading = 0b01_1111_1111_0000;
-        (self.adc_reading_to_mv(min_adc_reading), self.adc_reading_to_mv(max_adc_reading))
+        (self.adc_transfer_function().apply(min_adc_reading), self.adc_transfer_function().apply(max_adc_reading))
     }
 
     pub fn init<I2C>(&mut self, i2c: &mut I2C, config: &Config) -> Result<CalculatedValues, Error>
@@ -835,8 +907,8 @@ impl<const X: usize> BQ769x0<X> {
             ocdscd_range_used: range_to_use,
             scd_threshold: Amperes(((scd_threshold as u32) * 1000) / config.shunt.0),
             ocd_threshold: Amperes(((ocd_threshold as u32) * 1000) / config.shunt.0),
-            uv_threshold: self.adc_reading_to_mv(0b01_0000_0000_0000 | ((uv_bits as u16) << 4)),
-            ov_threshold: self.adc_reading_to_mv(0b10_0000_0000_1000 | ((ov_bits as u16) << 4))
+            uv_threshold: self.adc_transfer_function().apply(0b01_0000_0000_0000 | ((uv_bits as u16) << 4)),
+            ov_threshold: self.adc_transfer_function().apply(0b10_0000_0000_1000 | ((ov_bits as u16) << 4))
         })
     }
 
@@ -850,7 +922,7 @@ impl<const X: usize> BQ769x0<X> {
         self.write_raw(i2c, 0x04, &sysctrl1)
     }
 
-    fn temperature_source<I2C>(&mut self, i2c: &mut I2C, source: TemperatureSource) -> Result<(), Error>
+    pub fn set_temperature_source<I2C>(&mut self, i2c: &mut I2C, source: TemperatureSource) -> Result<(), Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
         let mut sysctrl1 = [0u8; 1];
@@ -861,7 +933,21 @@ impl<const X: usize> BQ769x0<X> {
         self.write_raw(i2c, 0x04, &sysctrl1)
     }
 
-    pub fn coulomb_counter_mode<I2C>(&mut self, i2c: &mut I2C, mode: CoulombCounterMode) -> Result<(), Error>
+    pub fn temperature_source<I2C>(&mut self, i2c: &mut I2C) -> Result<TemperatureSource, Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        let mut sysctrl1 = [0u8; 1];
+        self.read_raw(i2c, 0x04, &mut sysctrl1)?;
+        sysctrl1[0] = sysctrl1[0] & !(1 << 3);
+        let is_external = sysctrl1[0] & (1 << 3) != 0;
+        if is_external {
+            Ok(TemperatureSource::ExternalThermistor)
+        } else {
+            Ok(TemperatureSource::InternalDie)
+        }
+    }
+
+        pub fn coulomb_counter_mode<I2C>(&mut self, i2c: &mut I2C, mode: CoulombCounterMode) -> Result<(), Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
         let mut sysctrl2 = [0u8; 1];
@@ -876,6 +962,19 @@ impl<const X: usize> BQ769x0<X> {
     }
 }
 
+#[derive(Copy, Clone)]
+struct AdcTransferFunction {
+    gain: u16,
+    offset: i8
+}
+impl AdcTransferFunction {
+    fn apply(&self, adc_reading: u16) -> MilliVolts {
+        let adc_reading = adc_reading as i32;
+        let uv = adc_reading * self.gain as i32 + self.offset as i32 * 1000;
+        MilliVolts((uv / 1000) as u32)
+    }
+}
+
 pub enum CoulombCounterMode {
     Disabled,
     OneShot,
@@ -886,6 +985,12 @@ pub enum CoulombCounterMode {
 pub enum TemperatureSource {
     InternalDie,
     ExternalThermistor
+}
+
+#[derive(Eq, PartialEq, Copy, Clone)]
+pub enum Temperature {
+    InternalDie(DegreesCentigrade),
+    ExternalThermistor(DegreesCentigrade)
 }
 
 #[cfg(test)]
