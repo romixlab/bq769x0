@@ -5,7 +5,7 @@ authors = ["Roman Isaikin <romix.lab@gmail.com>"]
 edition = "2018"
 license = "MIT"
 description = "BQ76920, BQ76930 and BQ76940 battery AFE no_std hal"
-
+repository = "https://github.com/romixlab/bq769x0"
 
 [dependencies]
 embedded-hal = "0.2"
