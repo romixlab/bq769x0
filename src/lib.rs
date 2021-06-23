@@ -6,10 +6,9 @@
 use core::fmt;
 use core::fmt::Formatter;
 use embedded_hal;
+#[cfg(feature = "crc")]
 use crc_any::CRCu8;
 
-#[cfg(not(std))]
-use cortex_m;
 use core::ops::Sub;
 use bitflags::bitflags;
 
@@ -32,7 +31,7 @@ pub struct BQ769x0<const X: usize> {
 
 #[derive(Debug, Copy, Clone)]
 pub enum Error {
-    //#[cfg(crc)]
+    // #[cfg(crc)]
     CRCMismatch,
     I2CError,
     BufTooLarge,
@@ -448,7 +447,7 @@ pub struct CalculatedValues {
     pub ov_threshold: MilliVolts
 }
 
-impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
+impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized, [(); X * 4]: Sized {
     pub const fn new(dev_address: u8, cell_count: u8) -> Option<Self> {
         match X {
             BQ76920 | BQ76930 | BQ76940 => {
@@ -494,21 +493,21 @@ impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
         self.adc_offset
     }
 
-    // #[cfg(not(crc))]
-    // pub fn read_raw<I2C>(&mut self, i2c: &mut I2C, reg_address: u8, data: &mut [u8]) -> Result<(), Error>
-    //     where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
-    // {
-    //     #[cfg(no_std)] {
-    //         cortex_m::asm::delay(10000);
-    //     }
-    //
-    //     match i2c.write_read(self.dev_address, &[reg_address], data) {
-    //         Ok(_) => { Ok(()) },
-    //         Err(_) => { Err(Error::I2CError) },
-    //     }
-    // }
+    #[cfg(not(feature = "crc"))]
+    pub fn read_raw<I2C>(&mut self, i2c: &mut I2C, reg_address: u8, data: &mut [u8]) -> Result<(), Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        #[cfg(no_std)] {
+            cortex_m::asm::delay(10000);
+        }
 
-    //#[cfg(crc)]
+        match i2c.write_read(self.dev_address, &[reg_address], data) {
+            Ok(_) => { Ok(()) },
+            Err(_) => { Err(Error::I2CError) },
+        }
+    }
+
+    #[cfg(feature = "crc")]
     pub fn read_raw<I2C>(&mut self, i2c: &mut I2C, reg_address: u8, data: &mut [u8]) -> Result<(), Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
@@ -516,12 +515,12 @@ impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
             cortex_m::asm::delay(10000);
         //}
 
-        if data.len() > 10 {
+        if data.len() > X * 2 { // max 5/10/15 cell voltages * 2 bytes
             return Err(Error::BufTooLarge);
         } else if data.len() == 0 {
             return Ok(());
         }
-        let mut buf = [0u8; 10*2]; // byte,crc,byte,crc,...
+        let mut buf = [0u8; X * 4]; // byte,crc,byte,crc,...
         let r = i2c.write_read(self.dev_address, &[reg_address], &mut buf[0..data.len()*2]);
         let mut crc = CRCu8::crc8();
         crc.reset();
@@ -548,32 +547,36 @@ impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
         }
     }
 
-    // #[cfg(not(crc))]
-    // pub fn write_raw<I2C>(&mut self, i2c: &mut I2C, reg_address: u8, data: &[u8]) -> Result<(), Error>
-    //     where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
-    // {
-    //     #[cfg(no_std)] {
-    //         cortex_m::asm::delay(10000);
-    //     }
-    //
-    //     if data.len() > 8 {
-    //         return Err(Error::BufTooLarge);
-    //     } else if data.len() == 0 {
-    //         return Ok(());
-    //     }
-    //     let mut buf = [0u8; 8+1]; // reg,byte,byte,...
-    //     buf[0] = reg_address;
-    //     for (i, b) in data.iter().enumerate() {
-    //         buf[i + 1] = *b;
-    //     }
-    //
-    //     match i2c.write(self.dev_address, &buf[0..data.len()+1]) {
-    //         Ok(_) => { Ok(()) },
-    //         Err(_) => { Err(Error::I2CError) },
-    //     }
-    // }
+    #[cfg(not(feature = "crc"))]
+    pub fn write_raw<I2C>(&mut self, i2c: &mut I2C, reg_address: u8, data: &[u8]) -> Result<(), Error>
+        where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
+    {
+        #[cfg(no_std)] {
+            cortex_m::asm::delay(10000);
+        }
 
-    //#[cfg(crc)]
+        if data.len() > 8 {
+            return Err(Error::BufTooLarge);
+        } else if data.len() == 0 {
+            return Ok(());
+        }
+        let mut buf = [0u8; 8+1]; // reg,byte,byte,...
+        buf[0] = reg_address;
+        for (i, b) in data.iter().enumerate() {
+            buf[i + 1] = *b;
+        }
+
+        i2c.write(self.dev_address, &buf[0..data.len()+1]).map_err(|_| Error::I2CError)?;
+        i2c.write_read(self.dev_address, &[reg_address], &mut buf[0..data.len()]).map_err(|_| Error::I2CError)?;
+        for (i, x) in data.iter().zip(buf).enumerate() {
+            if *x.0 != x.1 {
+                return Err(Error::VerifyError(reg_address + i as u8));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "crc")]
     pub fn write_raw<I2C>(&mut self, i2c: &mut I2C, reg_address: u8, data: &[u8]) -> Result<(), Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
@@ -749,13 +752,7 @@ impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
     pub fn sys_stat_reset<I2C>(&mut self, i2c: &mut I2C, flags: SysStat) -> Result<(), Error>
         where I2C: embedded_hal::blocking::i2c::Write + embedded_hal::blocking::i2c::WriteRead
     {
-        self.write_raw(i2c, 0x00, &[flags.bits()])?;
-        let mut verify = [0u8; 1];
-        self.read_raw(i2c, 0x00, &mut verify)?;
-        if verify[0] & flags.bits() != 0 {
-            return Err(Error::VerifyError(0x00));
-        }
-        Ok(())
+        self.write_raw(i2c, 0x00, &[flags.bits()])
     }
 
     pub fn discharge<I2C>(&mut self, i2c: &mut I2C, enable: bool) -> Result<(), Error>
@@ -772,13 +769,7 @@ impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
         } else {
             sys_ctrl2[0] = sys_ctrl2[0] & !0b0000_0010;
         }
-        self.write_raw(i2c, 0x05, &sys_ctrl2)?;
-        let mut verify = [0u8; 1];
-        self.read_raw(i2c, 0x05, &mut verify)?;
-        if verify[0] != sys_ctrl2[0] {
-            return Err(Error::VerifyError(0x05));
-        }
-        Ok(())
+        self.write_raw(i2c, 0x05, &sys_ctrl2)
     }
 
     pub fn charge<I2C>(&mut self, i2c: &mut I2C, enable: bool) -> Result<(), Error>
@@ -795,13 +786,7 @@ impl<const X: usize> BQ769x0<X> where [(); X * 2]: Sized {
         } else {
             sys_ctrl2[0] = sys_ctrl2[0] & !0b0000_0001;
         }
-        self.write_raw(i2c, 0x05, &sys_ctrl2)?;
-        let mut verify = [0u8; 1];
-        self.read_raw(i2c, 0x05, &mut verify)?;
-        if verify[0] != sys_ctrl2[0] {
-            return Err(Error::VerifyError(0x05));
-        }
-        Ok(())
+        self.write_raw(i2c, 0x05, &sys_ctrl2)
     }
 
     pub fn is_charge_enabled<I2C>(&mut self, i2c: &mut I2C) -> Result<bool, Error>
