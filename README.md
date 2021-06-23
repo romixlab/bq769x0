@@ -6,12 +6,14 @@ Variant is chosen at compile time, as hardware is generally not changed on the f
 Cell count can be configured at runtime.
 
 ```rust
-let mut bq76920 = BQ769x0::<X = bq769x0::BQ76920>::new(0x08, 4).unwrap();
+let mut bq76920 = BQ769x0::<{bq769x0::BQ76920}>::new(0x08, 4).unwrap();
 ```
 `new()` will return None if cell count is invalid. Valid configurations is:
 * BQ76920 - 3 to 5 cells
 * BQ76930 - 6 to 10 cells
 * BQ76940 - 9 to 15 cells
+
+Due to the use of const generics this is a nightly only crate for now.
 
 Configure thresholds and timeouts:
 ```rust
