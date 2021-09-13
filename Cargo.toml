@@ -23,6 +23,5 @@ default-features = false
 
 [features]
 default = ["no_std"]
-crc = []
 no_std = []
 std = []
